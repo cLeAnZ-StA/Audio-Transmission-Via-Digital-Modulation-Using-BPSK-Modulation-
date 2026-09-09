@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDR Audio Transceiver</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+        button { 
+            padding: 15px 30px; 
+            font-size: 18px; 
+            margin: 10px; 
+            cursor: pointer; 
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
+        }
+        #graph-container { width: 100%; max-width: 600px; margin: 20px auto; }
+        .control-panel { margin: 20px auto; max-width: 600px; padding: 15px; border: 1px solid #ccc; border-radius: 8px; background: #f9f9f9; }
+        textarea { width: 100%; max-width: 600px; height: 120px; margin-top: 15px; font-family: monospace; font-size: 13px; padding: 10px; box-sizing: border-box; }
+    </style>
+</head>
+<body>
+    <h1>Digital Audio BPSK Transceiver</h1>
+    
+    <div>
+        <button onclick="setMode('tx')">Transmitter</button>
+        <button onclick="setMode('rx')">Receiver</button>
+    </div>
+
+    <!-- Live SNR Control Slider -->
+    <div class="control-panel">
+        <label><strong>Channel SNR (dB): </strong><span id="snr-display">30</span></label><br>
+        <input type="range" id="snr-slider" min="0" max="30" value="30" style="width: 90%; margin-top: 10px;" 
+               oninput="document.getElementById('snr-display').innerText = this.value">
+    </div>
+
+    <div id="tx-panel" style="display:none;">
+        <h2 id="tx-status">Ready to Transmit</h2>
+        <button 
+            onmousedown="startRecording()" 
+            onmouseup="stopRecording()" 
+            ontouchstart="startRecording()" 
+            ontouchend="stopRecording()">
+            Hold to Speak
+        </button>
+    </div>
+
+    <div id="rx-panel" style="display:none;">
+        <h2>Receiver Active</h2>
+        <audio id="audio-playback" autoplay controls></audio>
+    </div>
+
+    <!-- Live Telemetry Feed -->
+    <textarea id="sys-log" readonly placeholder="System Logs will appear here..."></textarea>
+
+    <div id="graph-container">
+        <canvas id="berChart"></canvas>
+    </div>
+
+    <script>
+        const socket = io();
+        let mediaRecorder;
+        let audioChunks = [];
+
+        function setMode(mode) {
+            if (mode === 'tx') {
+                document.getElementById('tx-panel').style.display = 'block';
+                document.getElementById('rx-panel').style.display = 'none';
+                setupMicrophone();
+            } else {
+                document.getElementById('tx-panel').style.display = 'none';
+                document.getElementById('rx-panel').style.display = 'block';
+                setupListener();
+            }
+        }
+
+        async function setupMicrophone() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                
+                mediaRecorder.ondataavailable = event => {
+                    if (event.data.size > 0) audioChunks.push(event.data);
+                };
+                
+                mediaRecorder.onstop = async () => {
+                    const currentMime = mediaRecorder.mimeType;
+                    const audioBlob = new Blob(audioChunks, { type: currentMime });
+                    audioChunks = [];
+                    const arrayBuffer = await audioBlob.arrayBuffer();
+                    const currentSnr = document.getElementById('snr-slider').value;
+                    
+                    document.getElementById('tx-status').innerText = "Sending Data...";
+                    
+                    // Send audio, format, and slider value
+                    socket.emit('send_audio', {
+                        audio: arrayBuffer,
+                        mimeType: currentMime,
+                        snr: currentSnr
+                    });
+                    
+                    setTimeout(() => document.getElementById('tx-status').innerText = "Ready to Transmit", 1000);
+                };
+            } catch (err) {
+                alert("Microphone access denied. Please ensure you are using the HTTPS ngrok link.");
+            }
+        }
+
+        function startRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'inactive') {
+                document.getElementById('tx-status').innerText = "Recording...";
+                audioChunks = [];
+                mediaRecorder.start();
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+        }
+
+        function setupListener() {
+            socket.on('receive_audio', (payload) => {
+                const audioUrl = URL.createObjectURL(new Blob([payload.audio], { type: payload.mimeType }));
+                const audioPlayer = document.getElementById('audio-playback');
+                audioPlayer.src = audioUrl;
+                
+                audioPlayer.play().catch(err => {
+                    console.log("Autoplay blocked. Tap play manually.", err);
+                });
+            });
+        }
+
+        // Live Telemetry Log Listener
+        socket.on('log', (data) => {
+            const logBox = document.getElementById('sys-log');
+            logBox.value += `> ${data.msg}\n`;
+            logBox.scrollTop = logBox.scrollHeight;
+        });
+
+        // Chart.js Implementation
+        const ctx = document.getElementById('berChart').getContext('2d');
+        const berChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Live Bit Error Rate (BER)',
+                    data: [],
+                    borderColor: '#00d2ff',
+                    backgroundColor: 'rgba(0, 210, 255, 0.2)',
+                    borderWidth: 2,
+                    tension: 0.3,
+                    fill: true
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: { 
+                    y: { 
+                        beginAtZero: true, 
+                        suggestedMax: 0.1,
+                        title: { display: true, text: 'BER' }
+                    } 
+                }
+            }
+        });
+
+        socket.on('telemetry', (data) => {
+            const timeNow = new Date().toLocaleTimeString([], { hour12: false });
+            berChart.data.labels.push(timeNow);
+            berChart.data.datasets[0].data.push(data.ber);
+            
+            if (berChart.data.labels.length > 10) {
+                berChart.data.labels.shift();
+                berChart.data.datasets[0].data.shift();
+            }
+            berChart.update();
+        });
+    </script>
+</body>
+</html>
